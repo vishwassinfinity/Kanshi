@@ -1,0 +1,33 @@
+# Build outputs
+build_make/*.elf
+build_make/*.hex
+build_make/*.map
+build_make/*.bin
+
+# Object files and dependency files
+**/*.o
+**/*.d
+**/*.a
+
+# macOS junk
+.DS_Store
+**/.DS_Store
+.Spotlight-V100
+.Trashes
+
+# VS Code settings (optional - remove this block if you want to share settings)
+.vscode/
+
+# Python (for future ML work in Phase 2)
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# TensorFlow Lite outputs (Phase 2)
+*.tflite
+*.pb
+
+# Logs
+*.log
