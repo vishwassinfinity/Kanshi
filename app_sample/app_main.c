@@ -1,100 +1,254 @@
-/*
- *----------------------------------------------------------------------
- *    micro T-Kernel 3.00.06
+/**
+ * @file app_main.c
+ * @brief Kanshi – Real-Time Anomaly Detection on µT-Kernel 3.0
  *
- *    Copyright (C) 2006-2022 by Ken Sakamura.
- *    This software is distributed under the T-License 2.2.
- *----------------------------------------------------------------------
- *
- *    Released by TRON Forum(http://www.tron.org) at 2022/10.
- *
- *----------------------------------------------------------------------
+ * Task architecture (priorities from kanshi_config.h):
+ *   ML Inference  (P1) – event-driven
+ *   Vibration     (P2) – 10 ms cyclic
+ *   Temperature   (P3) – 100 ms cyclic
+ *   System Monitor(P5) – 1 s cyclic
  */
 
 #include <tk/tkernel.h>
 #include <tm/tmonitor.h>
-#include <sys/sysdepend/cpu/nrf5/sysdef.h>
+#include <string.h>
 
-/* micro:bit v2 LED matrix GPIO pins (nRF52833) */
-/* Rows - P0 pins */
-#define LED_ROW1  (1UL << 21)
-#define LED_ROW2  (1UL << 22)
-#define LED_ROW3  (1UL << 15)
-#define LED_ROW4  (1UL << 24)
-#define LED_ROW5  (1UL << 19)
+#include "kanshi_config.h"
+#include "circular_buffer.h"
+#include "features.h"
+#include "inference.h"
+#include "alert.h"
+#include "hw_hal.h"
 
-/* Columns - P0 pins (active LOW) */
-#define LED_COL1  (1UL << 28)
-#define LED_COL2  (1UL << 11)
-#define LED_COL3  (1UL << 31)
-#define LED_COL5  (1UL << 30)
+/* -------------------------------------------------------------------------- */
+/* Global objects                                                             */
+/* -------------------------------------------------------------------------- */
+static ID               id_sem_buffer;
+static ID               id_flg_system;
+static circular_buffer_t g_cb;
+static alert_ctx_t      g_alert;
+static float            g_last_temp = 25.0f;
 
-/* P1 pin */
-#define LED_COL4  (1UL << 5)
-
-/* Register access macro */
-#define REG(addr)  (*((volatile UW*)(addr)))
-
-LOCAL void led_init(void)
+/* Approximate milliseconds from system time (timer period = 10 ms) */
+static UW get_ms(void)
 {
-    /* Set all ROW and COL pins as OUTPUT on P0 */
-    REG(GPIO_P0_BASE + GPIO_DIRSET) = 
-        LED_ROW1 | LED_ROW2 | LED_ROW3 | LED_ROW4 | LED_ROW5 |
-        LED_COL1 | LED_COL2 | LED_COL3 | LED_COL5;
-
-    /* COL4 is on P1 */
-    REG(GPIO_P1_BASE + GPIO_DIRSET) = LED_COL4;
-
-    /* Turn all LEDs OFF first */
-    /* Rows LOW, Cols HIGH (cols are active low) */
-    REG(GPIO_P0_BASE + GPIO_OUTCLR) =
-        LED_ROW1 | LED_ROW2 | LED_ROW3 | LED_ROW4 | LED_ROW5;
-    REG(GPIO_P0_BASE + GPIO_OUTSET) =
-        LED_COL1 | LED_COL2 | LED_COL3 | LED_COL5;
-    REG(GPIO_P1_BASE + GPIO_OUTSET) = LED_COL4;
+    SYSTIM t;
+    tk_get_otm(&t);
+    return t.lo;
 }
 
-LOCAL void led_on(void)
+/* -------------------------------------------------------------------------- */
+/* Vibration Task – highest frequency sampling                                */
+/* -------------------------------------------------------------------------- */
+static void task_vibration(INT stacd, void *exinf)
 {
-    /* Light up top-left LED: ROW1 HIGH, COL1 LOW */
-    REG(GPIO_P0_BASE + GPIO_OUTSET) = LED_ROW1;
-    REG(GPIO_P0_BASE + GPIO_OUTCLR) = LED_COL1;
-}
+    sensor_sample_t s;
+    UW now;
+    (void)stacd; (void)exinf;
 
-LOCAL void led_off(void)
-{
-    REG(GPIO_P0_BASE + GPIO_OUTCLR) = LED_ROW1;
-    REG(GPIO_P0_BASE + GPIO_OUTSET) = LED_COL1;
-}
+    tm_printf((UB*)"Vibration task started\n");
 
-LOCAL void main_task(INT stacd, void *exinf)
-{
-    INT count = 0;
+    for (;;) {
+        now = get_ms();
+        s.timestamp_ms = now;
 
-    led_init();
+        if (hw_read_accel(&s.x, &s.y, &s.z) == E_OK) {
+            s.temp = g_last_temp;   /* latest temp snapshot */
+            if (cb_push(&g_cb, &s) == E_OK) {
+                /* signal when a full window is ready */
+                if (g_cb.window_ready)
+                    tk_set_flg(id_flg_system, EVT_WINDOW_READY);
+            }
+        }
 
-    while(1) {
-        count++;
-        tm_printf((UB*)"Kanshi tick %d - LED ON\n", count);
-        led_on();
-        tk_dly_tsk(500);
-
-        tm_printf((UB*)"Kanshi tick %d - LED OFF\n", count);
-        led_off();
-        tk_dly_tsk(500);
+        tk_dly_tsk(SAMPLE_PERIOD_MS);
     }
 }
 
-EXPORT INT usermain(void)
+/* -------------------------------------------------------------------------- */
+/* Temperature Task                                                           */
+/* -------------------------------------------------------------------------- */
+static void task_temperature(INT stacd, void *exinf)
+{
+    float t;
+    (void)stacd; (void)exinf;
+
+    tm_printf((UB*)"Temperature task started\n");
+
+    for (;;) {
+        if (hw_read_temp(&t) == E_OK) {
+            g_last_temp = t;
+            if (t >= TEMP_CRIT_C)
+                tk_set_flg(id_flg_system, EVT_TEMP_CRITICAL);
+            else if (t >= TEMP_WARN_C)
+                tk_set_flg(id_flg_system, EVT_TEMP_WARNING);
+        }
+        tk_dly_tsk(TEMP_PERIOD_MS);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* ML Inference Task – event driven                                           */
+/* -------------------------------------------------------------------------- */
+static void task_ml_inference(INT stacd, void *exinf)
+{
+    UINT flgptn;
+    sensor_sample_t window[WINDOW_SAMPLES];
+    float features[NUM_FEATURES];
+    inference_result_t result;
+    UW n, now;
+    (void)stacd; (void)exinf;
+
+    tm_printf((UB*)"ML Inference task started\n");
+
+    for (;;) {
+        /* wait for any of the interesting events */
+        tk_wai_flg(id_flg_system, EVT_ALL, TWF_ORW | TWF_CLR, &flgptn, TMO_FEVR);
+
+        now = get_ms();
+
+        if (flgptn & EVT_WINDOW_READY) {
+            if (cb_get_window(&g_cb, window, &n) == E_OK) {
+                extract_features(window, n, features);
+                if (inference_run(features, &result) == E_OK) {
+                    alert_update(&g_alert, &result, g_last_temp, now);
+                    hw_led_set(g_alert.state);
+
+                    if (result.class_id != CLASS_NORMAL)
+                        tk_set_flg(id_flg_system, EVT_ANOMALY);
+
+                    /* optional latency log */
+                    if (result.inference_us > 100000)  /* >100 ms warning */
+                        tm_printf((UB*)"WARN: inference %u us\n",
+                                  result.inference_us);
+                }
+                cb_mark_consumed(&g_cb);
+            }
+        }
+
+        /* temperature events also feed the alert machine */
+        if (flgptn & (EVT_TEMP_WARNING | EVT_TEMP_CRITICAL)) {
+            inference_result_t dummy = {0};
+            dummy.probability = (flgptn & EVT_TEMP_CRITICAL) ? 0.9f : 0.6f;
+            dummy.class_id    = (flgptn & EVT_TEMP_CRITICAL) ?
+                                CLASS_CRITICAL : CLASS_WARNING;
+            alert_update(&g_alert, &dummy, g_last_temp, now);
+            hw_led_set(g_alert.state);
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* System Monitor Task                                                        */
+/* -------------------------------------------------------------------------- */
+static void task_system_monitor(INT stacd, void *exinf)
+{
+    UW now;
+    (void)stacd; (void)exinf;
+
+    tm_printf((UB*)"System monitor started\n");
+
+    for (;;) {
+        now = get_ms();
+        hw_watchdog_feed();
+
+        if (hw_button_pressed())
+            alert_manual_reset(&g_alert);
+
+        /* simple liveness / state report every 5 s */
+        static UW last_report;
+        if (now - last_report >= 5000) {
+            tm_printf((UB*)"[mon] state=%d temp=%.1f hist=%u\n",
+                      (int)g_alert.state, (double)g_last_temp,
+                      g_alert.hist_count);
+            last_report = now;
+        }
+
+        tk_dly_tsk(1000);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Object creation helpers                                                    */
+/* -------------------------------------------------------------------------- */
+static ID create_task(FP entry, PRI pri, SZ stksz, const char *name)
 {
     T_CTSK ctsk;
-    tm_putstring((UB*)"Kanshi booting...\n");
-    ctsk.itskpri = 10;
-    ctsk.stksz   = 1024;
-    ctsk.task    = main_task;
-    ctsk.tskatr  = TA_HLNG | TA_RNG3;
-    ID tskid = tk_cre_tsk(&ctsk);
-    tk_sta_tsk(tskid, 0);
-    tk_slp_tsk(TMO_FEVR);
-    return 0;
+    ID id;
+
+    memset(&ctsk, 0, sizeof(ctsk));
+    ctsk.tskatr  = TA_HLNG | TA_RNG0;
+    ctsk.task    = entry;
+    ctsk.itskpri = pri;
+    ctsk.stksz   = stksz;
+#if USE_OBJECT_NAME
+    strncpy((char*)ctsk.dsname, name, 8);
+#endif
+
+    id = tk_cre_tsk(&ctsk);
+    if (id < E_OK) {
+        tm_printf((UB*)"FAIL create %s: %d\n", name, id);
+        return id;
+    }
+    return id;
+}
+
+/* -------------------------------------------------------------------------- */
+/* usermain – entry point required by µT-Kernel                               */
+/* -------------------------------------------------------------------------- */
+EXPORT INT usermain(void)
+{
+    T_CSEM csem;
+    T_CFLG cflg;
+    ID id_vib, id_temp, id_ml, id_mon;
+    ER er;
+
+    tm_printf((UB*)"\n=== Kanshi: Real-Time Anomaly Detection ===\n");
+    tm_printf((UB*)"µT-Kernel 3.0 + On-Device TinyML (fallback classifier)\n\n");
+
+    /* --- hardware --- */
+    er = hw_init();
+    if (er < E_OK) {
+        tm_printf((UB*)"hw_init failed %d\n", er);
+        return er;
+    }
+
+    /* --- semaphore for circular buffer --- */
+    memset(&csem, 0, sizeof(csem));
+    csem.sematr  = TA_TFIFO | TA_FIRST;
+    csem.isemcnt = 1;
+    csem.maxsem  = 1;
+    id_sem_buffer = tk_cre_sem(&csem);
+    if (id_sem_buffer < E_OK) return id_sem_buffer;
+
+    /* --- event flag --- */
+    memset(&cflg, 0, sizeof(cflg));
+    cflg.flgatr  = TA_TFIFO | TA_WMUL;
+    cflg.iflgptn = 0;
+    id_flg_system = tk_cre_flg(&cflg);
+    if (id_flg_system < E_OK) return id_flg_system;
+
+    /* --- application objects --- */
+    cb_init(&g_cb, id_sem_buffer);
+    alert_init(&g_alert);
+    inference_init();
+
+    /* --- create & start tasks --- */
+    id_vib  = create_task(task_vibration,     PRI_VIBRATION,      STACK_VIBRATION,      "vib");
+    id_temp = create_task(task_temperature,   PRI_TEMPERATURE,    STACK_TEMPERATURE,    "temp");
+    id_ml   = create_task(task_ml_inference,  PRI_ML_INFERENCE,   STACK_ML_INFERENCE,   "ml");
+    id_mon  = create_task(task_system_monitor,PRI_SYSTEM_MONITOR, STACK_SYSTEM_MONITOR, "mon");
+
+    if (id_vib < E_OK || id_temp < E_OK || id_ml < E_OK || id_mon < E_OK)
+        return E_SYS;
+
+    tk_sta_tsk(id_vib,  0);
+    tk_sta_tsk(id_temp, 0);
+    tk_sta_tsk(id_ml,   0);
+    tk_sta_tsk(id_mon,  0);
+
+    tm_printf((UB*)"All tasks running. Monitoring…\n");
+
+    /* usermain may return; kernel continues with the created tasks */
+    return E_OK;
 }
